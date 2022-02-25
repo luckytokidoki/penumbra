@@ -1,7 +1,7 @@
 [package]
 name = "penumbra-crypto"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,11 +15,14 @@ penumbra-proto = { path = "../proto/" }
 ark-ff = { git = "https://github.com/penumbra-zone/algebra", branch = "ours" }
 ark-serialize = { git = "https://github.com/penumbra-zone/algebra", branch = "ours" }
 decaf377 = { git = "https://github.com/penumbra-zone/decaf377" }
-decaf377-rdsa = { git = "https://github.com/penumbra-zone/decaf377-rdsa" }
+decaf377-rdsa = { version = "0.5", git = "https://github.com/penumbra-zone/decaf377-rdsa" }
 incrementalmerkletree = { git = "https://github.com/penumbra-zone/incrementalmerkletree" }
 poseidon377 = { git = "https://github.com/penumbra-zone/poseidon377" }
+jmt = { git = "https://github.com/penumbra-zone/jellyfish-merkle.git", branch = "async-poc" }
+f4jumble = { git = "https://github.com/zcash/librustzcash", rev="2425a0869098e3b0588ccd73c42716bcf418612c" }
 
 # Crates.io deps
+regex = "1.5"
 sha2 = "0.9"
 bech32 = "0.8.1"
 fpe = "0.5"
@@ -27,9 +30,11 @@ aes = "0.7"
 anyhow = "1"
 thiserror = "1"
 bytes = "1"
+derivative = "2.2"
 hex = "0.4"
 blake2b_simd = "0.5"
 serde = { version = "1", features = ["derive"] }
+serde_with = { version = "1.11", features = ["hex"] }
 once_cell = "1.8"
 rand_core = { version = "0.6.3", features = ["getrandom"] }
 rand = "0.8"
@@ -38,3 +43,9 @@ chacha20poly1305 = "0.9.0"
 num-bigint = "0.4"
 # this allows us to implement Decode for crypto types without orphan rule issues
 sqlx = { version = "0.5.9", features = ["postgres"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
+bincode = "1"
+serde_json = "1"
+sqlx = { version = "0.5.9", features = ["postgres", "runtime-tokio-rustls"] }

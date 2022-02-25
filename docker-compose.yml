@@ -7,47 +7,89 @@ services:
       context: .
     environment:
       - RUST_LOG=${RUST_LOG:-warn,pd=info,penumbra=info}
-    command:
-      pd start --host 0.0.0.0 --database-uri postgres://postgres:postgres@db/penumbra
+    command: pd start --host 0.0.0.0 --database-uri
+      postgres://postgres:postgres@db/penumbra
     restart: on-failure
-    depends_on:
-      - db
-    links:
-      - db:db
     networks:
       localnet:
         ipv4_address: 192.167.10.6
-
-  # database - postgres
-  db:
-    image: postgres:14.0
-    container_name: db
-    volumes:
-      - "db_data:/var/lib/postgresql/data"
-    environment:
-      - POSTGRES_DB=penumbra
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-    networks:
-      localnet:
-        ipv4_address: 192.167.10.12
+    ports:
+      - "26658:26658"
+      - "26666:26666"
+      - "26667:26667"
 
   # The Tendermint node
-  tendermint:
-    container_name: tendermint
-    image: "tendermint/tendermint"
+  tendermint-node0:
+    image: "tendermint/tendermint:latest"
+    container_name: tendermint-node0
     ports:
-      - "26656-26657:26656-26657"
-      - "6060:6060"
-      - "27000:26660"
+      - "26656:26656"
+      - "26657:26657"
     volumes:
-      - "tendermint_data:/tendermint"
-    command: node --proxy-app=tcp://pd:26658
+      - ~/scratch/testnet_build/node0:/tendermint
+    command: start --proxy-app=tcp://pd:26658
+    environment:
+      - ID=0
+      - LOG=${LOG:-tendermint.log}
     depends_on:
       - pd
     networks:
       localnet:
         ipv4_address: 192.167.10.2
+
+  # The Tendermint node
+  # tendermint-node1:
+  #   image: "tendermint/tendermint:latest"
+  #   container_name: tendermint-node1
+  #   ports:
+  #     - "26659-26660:26656-26657"
+  #   volumes:
+  #     - ~/scratch/testnet_build/node1:/tendermint:Z
+  #   command: start --proxy-app=tcp://pd:26658
+  #   environment:
+  #     - ID=1
+  #     - LOG=${LOG:-tendermint.log}
+  #   depends_on:
+  #     - pd
+  #   networks:
+  #     localnet:
+  #       ipv4_address: 192.167.10.3
+
+  # # The Tendermint node
+  # tendermint-node2:
+  #   image: "tendermint/tendermint:latest"
+  #   container_name: tendermint-node2
+  #   ports:
+  #     - "26661-26662:26656-26657"
+  #   volumes:
+  #     - ~/scratch/testnet_build/node2:/tendermint:Z
+  #   command: start --proxy-app=tcp://pd:26658
+  #   environment:
+  #     - ID=2
+  #     - LOG=${LOG:-tendermint.log}
+  #   depends_on:
+  #     - pd
+  #   networks:
+  #     localnet:
+  #       ipv4_address: 192.167.10.4
+
+  # # The Tendermint node
+  # tendermint-node3:
+  #   image: "tendermint/tendermint:latest"
+  #   container_name: tendermint-node3
+  #   ports:
+  #     - "26663-26664:26656-26657"
+  #   volumes:
+  #     - ~/scratch/testnet_build/node3:/tendermint:Z
+  #   command: start --proxy-app=tcp://pd:26658
+  #   environment:
+  #     - ID=3
+  #     - LOG=${LOG:-tendermint.log}
+  #   depends_on:
+  #     - pd
+  #   networks:
+  #     localnet:
+  #       ipv4_address: 192.167.10.5
 
 networks:
   localnet:
@@ -55,9 +97,4 @@ networks:
     ipam:
       driver: default
       config:
-      -
-        subnet: 192.167.10.0/16
-
-volumes:
-  tendermint_data: {}
-  db_data: {}
+        - subnet: 192.167.10.0/16

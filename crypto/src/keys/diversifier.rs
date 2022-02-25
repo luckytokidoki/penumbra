@@ -1,16 +1,20 @@
+use std::convert::{TryFrom, TryInto};
+
 use aes::Aes256;
 use anyhow::anyhow;
 use ark_ff::PrimeField;
+use derivative::Derivative;
 use fpe::ff1;
-use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
 
 use crate::Fq;
 
 pub const DIVERSIFIER_LEN_BYTES: usize = 11;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Diversifier(pub [u8; DIVERSIFIER_LEN_BYTES]);
+#[derive(Copy, Clone, PartialEq, Eq, Derivative)]
+#[derivative(Debug)]
+pub struct Diversifier(
+    #[derivative(Debug(bound = "", format_with = "crate::fmt_hex"))] pub [u8; DIVERSIFIER_LEN_BYTES],
+);
 
 impl Diversifier {
     /// Generate the diversified basepoint associated to this diversifier.
@@ -46,8 +50,11 @@ impl TryFrom<&[u8]> for Diversifier {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct DiversifierKey(pub(super) [u8; 32]);
+#[derive(Clone, Derivative)]
+#[derivative(Debug)]
+pub struct DiversifierKey(
+    #[derivative(Debug(bound = "", format_with = "crate::fmt_hex"))] pub(super) [u8; 32],
+);
 
 impl DiversifierKey {
     pub fn diversifier_for_index(&self, index: &DiversifierIndex) -> Diversifier {
@@ -60,10 +67,27 @@ impl DiversifierKey {
         diversifier_bytes.copy_from_slice(&enc_index.to_bytes_le());
         Diversifier(diversifier_bytes)
     }
+
+    pub fn index_for_diversifier(&self, diversifier: &Diversifier) -> DiversifierIndex {
+        let index = ff1::FF1::<Aes256>::new(&self.0, 2)
+            .expect("radix 2 is in range")
+            .decrypt(
+                b"",
+                &ff1::BinaryNumeralString::from_bytes_le(&diversifier.0),
+            )
+            .expect("binary string is in the configured radix (2)");
+
+        let mut index_bytes = [0; 11];
+        index_bytes.copy_from_slice(&index.to_bytes_le());
+        DiversifierIndex(index_bytes)
+    }
 }
 
-#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
-pub struct DiversifierIndex(pub [u8; 11]);
+#[derive(Copy, Clone, PartialEq, Eq, Derivative)]
+#[derivative(Debug)]
+pub struct DiversifierIndex(
+    #[derivative(Debug(bound = "", format_with = "crate::fmt_hex"))] pub [u8; 11],
+);
 
 impl From<u8> for DiversifierIndex {
     fn from(x: u8) -> Self {
@@ -103,12 +127,45 @@ impl From<usize> for DiversifierIndex {
     }
 }
 
-impl From<DiversifierIndex> for u64 {
-    fn from(diversifier_index: DiversifierIndex) -> Self {
-        u64::from_le_bytes(
-            diversifier_index.0[0..8]
-                .try_into()
-                .expect("can take first 8 bytes of diversifier index"),
-        )
+impl TryFrom<DiversifierIndex> for u64 {
+    type Error = anyhow::Error;
+    fn try_from(diversifier_index: DiversifierIndex) -> Result<Self, Self::Error> {
+        let bytes = &diversifier_index.0;
+        if bytes[8] == 0 && bytes[9] == 0 && bytes[10] == 0 {
+            Ok(u64::from_le_bytes(
+                bytes[0..8]
+                    .try_into()
+                    .expect("can take first 8 bytes of 11-byte array"),
+            ))
+        } else {
+            Err(anyhow::anyhow!("diversifier index out of range"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn diversifier_index_strategy() -> BoxedStrategy<DiversifierIndex> {
+        any::<[u8; 11]>().prop_map(DiversifierIndex).boxed()
+    }
+
+    fn diversifier_key_strategy() -> BoxedStrategy<DiversifierKey> {
+        any::<[u8; 32]>().prop_map(DiversifierKey).boxed()
+    }
+
+    proptest! {
+        #[test]
+        fn diversifier_encryption_roundtrip(
+            key in diversifier_key_strategy(),
+            index in diversifier_index_strategy(),
+        ) {
+            let diversifier = key.diversifier_for_index(&index);
+            let index2 = key.index_for_diversifier(&diversifier);
+            assert_eq!(index2, index );
+        }
     }
 }

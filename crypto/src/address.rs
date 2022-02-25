@@ -1,17 +1,19 @@
 use std::io::{Cursor, Read, Write};
 
-use anyhow::anyhow;
 use ark_serialize::CanonicalDeserialize;
-use bech32::{FromBase32, ToBase32, Variant};
+use f4jumble::{f4jumble, f4jumble_inv};
+use penumbra_proto::{crypto as pb, serializers::bech32str};
+use serde::{Deserialize, Serialize};
 
 use crate::{fmd, ka, keys::Diversifier, Fq};
 
-pub const CURRENT_CHAIN_ID: &str = "penumbra-tn001";
-/// Human-readable prefix in the address.
-pub const CURRENT_NETWORK_ID: &str = "penumbra_tn001_";
+// We pad addresses to 80 bytes (before jumbling and Bech32m encoding)
+// using this 5 byte padding.
+const ADDR_PADDING: &[u8] = "pen00".as_bytes();
 
 /// A valid payment address.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "pb::Address", into = "pb::Address")]
 pub struct Address {
     d: Diversifier,
     /// cached copy of the diversified base
@@ -72,26 +74,71 @@ impl Address {
     }
 }
 
+impl From<Address> for pb::Address {
+    fn from(a: Address) -> Self {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        bytes
+            .write_all(&a.diversifier().0)
+            .expect("can write diversifier into vec");
+        bytes
+            .write_all(&a.transmission_key().0)
+            .expect("can write transmission key into vec");
+        bytes
+            .write_all(&a.clue_key().0)
+            .expect("can write clue key into vec");
+        bytes
+            .write_all(ADDR_PADDING)
+            .expect("can write padding into vec");
+
+        let jumbled_bytes = f4jumble(bytes.get_ref()).expect("can jumble");
+        pb::Address {
+            inner: jumbled_bytes,
+        }
+    }
+}
+
+impl TryFrom<pb::Address> for Address {
+    type Error = anyhow::Error;
+    fn try_from(value: pb::Address) -> Result<Self, Self::Error> {
+        let unjumbled_bytes =
+            f4jumble_inv(&value.inner).ok_or_else(|| anyhow::anyhow!("invalid address"))?;
+        let mut bytes = Cursor::new(unjumbled_bytes);
+
+        let mut diversifier_bytes = [0u8; 11];
+        bytes.read_exact(&mut diversifier_bytes)?;
+
+        let mut pk_d_bytes = [0u8; 32];
+        bytes.read_exact(&mut pk_d_bytes)?;
+
+        let mut clue_key_bytes = [0; 32];
+        bytes.read_exact(&mut clue_key_bytes)?;
+
+        let mut padding_bytes = [0; 5];
+        bytes.read_exact(&mut padding_bytes)?;
+
+        if padding_bytes != ADDR_PADDING {
+            return Err(anyhow::anyhow!("invalid address"));
+        }
+
+        let diversifier = Diversifier(diversifier_bytes);
+        Address::from_components(
+            diversifier,
+            diversifier.diversified_generator(),
+            ka::Public(pk_d_bytes),
+            fmd::ClueKey(clue_key_bytes),
+        )
+        .ok_or_else(|| anyhow::anyhow!("invalid address"))
+    }
+}
+
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let mut addr_content = std::io::Cursor::new(Vec::new());
-        addr_content
-            .write_all(&self.diversifier().0)
-            .expect("can write diversifier into vec");
-        addr_content
-            .write_all(&self.transmission_key().0)
-            .expect("can write transmission key into vec");
-        addr_content
-            .write_all(&self.clue_key().0)
-            .expect("can write clue key into vec");
-
-        bech32::encode_to_fmt(
-            f,
-            CURRENT_NETWORK_ID,
-            addr_content.get_ref().to_base32(),
-            Variant::Bech32m,
-        )
-        .map_err(|_| std::fmt::Error)?
+        let proto_address = pb::Address::from(self.clone());
+        f.write_str(&bech32str::encode(
+            &proto_address.inner,
+            bech32str::address::BECH32_PREFIX,
+            bech32str::Bech32m,
+        ))
     }
 }
 
@@ -99,47 +146,45 @@ impl std::str::FromStr for Address {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (hrp, data, variant) = bech32::decode(s).unwrap();
-
-        let mut decoded_bytes = Cursor::new(Vec::<u8>::from_base32(&data).unwrap());
-
-        let mut diversifier_bytes = [0u8; 11];
-        decoded_bytes.read_exact(&mut diversifier_bytes)?;
-
-        let mut pk_d_bytes = [0u8; 32];
-        decoded_bytes.read_exact(&mut pk_d_bytes)?;
-
-        let mut clue_key_bytes = [0; 32];
-        decoded_bytes.read_exact(&mut clue_key_bytes)?;
-
-        if variant != Variant::Bech32m {
-            return Err(anyhow!(
-                "incorrectly formatted address, only Bech32m supported"
-            ));
+        pb::Address {
+            inner: bech32str::decode(s, bech32str::address::BECH32_PREFIX, bech32str::Bech32m)?,
         }
-
-        if hrp != CURRENT_NETWORK_ID {
-            return Err(anyhow!("network ID no longer supported: {}", hrp));
-        }
-
-        let diversifier = Diversifier(diversifier_bytes);
-        Ok(Address::from_components(
-            diversifier,
-            diversifier.diversified_generator(),
-            ka::Public(pk_d_bytes),
-            fmd::ClueKey(clue_key_bytes),
-        )
-        .expect("transmission key is valid"))
+        .try_into()
     }
+}
+
+/// Parse v0 testnet address string (temporary migration used in `pcli`)
+pub fn parse_v0_testnet_address(v0_address: String) -> Result<Address, anyhow::Error> {
+    let decoded_bytes = &bech32str::decode(&v0_address, "penumbrav0t", bech32str::Bech32m)?;
+
+    let mut bytes = Cursor::new(decoded_bytes);
+    let mut diversifier_bytes = [0u8; 11];
+    bytes.read_exact(&mut diversifier_bytes)?;
+    let mut pk_d_bytes = [0u8; 32];
+    bytes.read_exact(&mut pk_d_bytes)?;
+    let mut clue_key_bytes = [0; 32];
+    bytes.read_exact(&mut clue_key_bytes)?;
+
+    let diversifier = Diversifier(diversifier_bytes);
+    let addr = Address::from_components(
+        diversifier,
+        diversifier.diversified_generator(),
+        ka::Public(pk_d_bytes),
+        fmd::ClueKey(clue_key_bytes),
+    )
+    .ok_or_else(|| anyhow::anyhow!("invalid address"))?;
+
+    Ok(addr)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::keys::SpendKey;
-    use rand_core::OsRng;
     use std::str::FromStr;
+
+    use rand_core::OsRng;
+
+    use super::*;
+    use crate::keys::SpendKey;
 
     #[test]
     fn test_address_encoding() {

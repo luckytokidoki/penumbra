@@ -1,12 +1,13 @@
+use std::convert::TryFrom;
+
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
+use super::{FullViewingKey, IncomingViewingKey, NullifierKey, OutgoingViewingKey};
 use crate::{
     prf,
     rdsa::{SigningKey, SpendAuth},
 };
-
-use super::{FullViewingKey, IncomingViewingKey, NullifierKey, OutgoingViewingKey};
 
 pub const SPENDSEED_LEN_BYTES: usize = 32;
 
@@ -68,5 +69,21 @@ impl SpendKey {
 
     pub fn incoming_viewing_key(&self) -> &IncomingViewingKey {
         self.fvk.incoming()
+    }
+}
+
+impl TryFrom<&[u8]> for SpendSeed {
+    type Error = anyhow::Error;
+    fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
+        if slice.len() != SPENDSEED_LEN_BYTES {
+            return Err(anyhow::anyhow!(
+                "spendseed must be 32 bytes, got {:?}",
+                slice.len()
+            ));
+        }
+
+        let mut bytes = [0u8; SPENDSEED_LEN_BYTES];
+        bytes.copy_from_slice(&slice[0..32]);
+        Ok(SpendSeed(bytes))
     }
 }

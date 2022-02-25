@@ -1,29 +1,53 @@
-use anyhow::{anyhow, Result};
-use comfy_table::{presets, Table};
+#![allow(clippy::clone_on_copy)]
+use std::path::PathBuf;
+
+use anyhow::Result;
 use directories::ProjectDirs;
-use rand_core::OsRng;
-use std::path::{Path, PathBuf};
 use structopt::StructOpt;
 
-use penumbra_proto::wallet::{
-    wallet_client::WalletClient, AssetListRequest, AssetLookupRequest, TransactionByNoteRequest,
-};
-use penumbra_wallet::{ClientState, Wallet};
-
-pub mod opt;
-pub mod warning;
-use opt::*;
-
-mod sync;
-pub use sync::sync;
-
+mod command;
+mod fetch;
+mod network;
 mod state;
-pub use state::ClientStateFile;
+mod sync;
+mod warning;
+
+use command::*;
+use state::ClientStateFile;
+use sync::sync;
+
+#[derive(Debug, StructOpt)]
+#[structopt(
+    name = "pcli",
+    about = "The Penumbra command-line interface.",
+    version = env!("VERGEN_GIT_SEMVER"),
+)]
+pub struct Opt {
+    /// The address of the pd+tendermint node.
+    #[structopt(short, long, default_value = "testnet.penumbra.zone")]
+    pub node: String,
+    /// The port to use to speak to tendermint.
+    #[structopt(short, long, default_value = "26657")]
+    pub rpc_port: u16,
+    /// The port to use to speak to pd's light wallet server.
+    #[structopt(short, long, default_value = "26666")]
+    pub light_wallet_port: u16,
+    /// The port to use to speak to pd's thin wallet server.
+    #[structopt(short, long, default_value = "26667")]
+    pub thin_wallet_port: u16,
+    #[structopt(subcommand)]
+    pub cmd: Command,
+    /// The location of the wallet file [default: platform appdata directory]
+    #[structopt(short, long)]
+    pub wallet_location: Option<String>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Display a warning message to the user so they don't get upset when all their tokens are lost.
-    warning::display();
+    if std::env::var("PCLI_UNLEASH_DANGER").is_err() {
+        warning::display();
+    }
 
     tracing_subscriber::fmt::init();
     let opt = Opt::from_args();
@@ -35,161 +59,43 @@ async fn main() -> Result<()> {
 
     // We store wallet data in `penumbra_wallet.dat` in the state directory, unless
     // the user provides another location.
-    let wallet_path: PathBuf;
-    match opt.wallet_location {
-        Some(path) => {
-            wallet_path = Path::new(&path).to_path_buf();
-        }
-        None => {
-            wallet_path = project_dir.data_dir().join("penumbra_wallet.json");
-        }
+    let wallet_path = opt.wallet_location.as_ref().map_or_else(
+        || project_dir.data_dir().join("penumbra_wallet.json"),
+        PathBuf::from,
+    );
+
+    // The wallet command takes the wallet_path directly, since it may need to create the client state,
+    // so handle it specially here so that we can have common code for the other subcommands.
+    if let Command::Wallet(wallet_cmd) = &opt.cmd {
+        wallet_cmd.exec(wallet_path)?;
+        return Ok(());
     }
 
-    match opt.cmd {
+    // Synchronize the wallet if the command requires it to be synchronized before it is run.
+    let mut state = ClientStateFile::load(wallet_path.clone())?;
+
+    // Chain params may not have been fetched yet, do so if necessary.
+    if state.chain_params().is_none() {
+        fetch::chain_params(&opt, &mut state).await?;
+    }
+    // From now on, we can .expect() on the chain params.
+
+    if opt.cmd.needs_sync() {
+        sync(&opt, &mut state).await?;
+        fetch::assets(&opt, &mut state).await?;
+    };
+
+    match &opt.cmd {
+        Command::Wallet(_) => unreachable!("wallet command already executed"),
         Command::Sync => {
-            let mut state = ClientStateFile::load(wallet_path)?;
-            sync(
-                &mut state,
-                format!("http://{}:{}", opt.node, opt.wallet_port),
-            )
-            .await?;
+            // We have already synchronized the wallet above, so we can just return.
         }
-        Command::Tx(TxCmd::Send {
-            amount: _,
-            denomination: _,
-            address: _,
-            fee,
-        }) => {
-            let mut state = ClientStateFile::load(wallet_path)?;
-            sync(
-                &mut state,
-                format!("http://{}:{}", opt.node, opt.wallet_port),
-            )
-            .await?;
-            let dummy_tx = state.new_transaction(&mut OsRng, fee)?;
-            let serialized_tx: Vec<u8> = dummy_tx.into();
-
-            let rsp = reqwest::get(format!(
-                r#"http://{}:{}/broadcast_tx_async?tx=0x{}"#,
-                opt.node,
-                opt.abci_port,
-                hex::encode(serialized_tx)
-            ))
-            .await?
-            .text()
-            .await?;
-
-            tracing::info!("{}", rsp);
-        }
-        Command::Query { key } => {
-            // TODO: get working as part of issue 22
-            let rsp: serde_json::Value = reqwest::get(format!(
-                r#"http://{}:{}/abci_query?data=0x{}"#,
-                opt.node,
-                opt.abci_port,
-                hex::encode(key),
-            ))
-            .await?
-            .json()
-            .await?;
-
-            tracing::info!(?rsp);
-        }
-        Command::Wallet(WalletCmd::Generate) => {
-            if wallet_path.exists() {
-                return Err(anyhow::anyhow!(
-                    "Wallet path {} already exists, refusing to overwrite it",
-                    wallet_path.display()
-                ));
-            }
-            let state = ClientState::new(Wallet::generate(&mut OsRng));
-            println!("Saving wallet to {}", wallet_path.display());
-            ClientStateFile::save(state, wallet_path)?;
-        }
-        Command::Wallet(WalletCmd::Delete) => {
-            if wallet_path.is_file() {
-                std::fs::remove_file(&wallet_path)?;
-                println!("Deleted wallet file at {}", wallet_path.display());
-            } else if wallet_path.exists() {
-                return Err(anyhow!(
-                    "Expected wallet file at {} but found something that is not a file; refusing to delete it",
-                    wallet_path.display()
-                ));
-            } else {
-                return Err(anyhow!(
-                    "No wallet exists at {}, so it cannot be deleted",
-                    wallet_path.display()
-                ));
-            }
-        }
-        Command::Addr(AddrCmd::List) => {
-            let state = ClientStateFile::load(wallet_path)?;
-
-            let mut table = Table::new();
-            table.load_preset(presets::NOTHING);
-            table.set_header(vec!["Index", "Label", "Address"]);
-            for (index, label, address) in state.wallet().addresses() {
-                table.add_row(vec![index.to_string(), label, address.to_string()]);
-            }
-            println!("{}", table);
-        }
-        Command::Addr(AddrCmd::New { label }) => {
-            let mut state = ClientStateFile::load(wallet_path)?;
-            let (index, address, _dtk) = state.wallet_mut().new_address(label.clone());
-            state.commit()?;
-
-            let mut table = Table::new();
-            table.load_preset(presets::NOTHING);
-            table.set_header(vec!["Index", "Label", "Address"]);
-            table.add_row(vec![index.to_string(), label, address.to_string()]);
-            println!("{}", table);
-        }
-        Command::FetchByNoteCommitment { note_commitment } => {
-            let mut client =
-                WalletClient::connect(format!("http://{}:{}", opt.node, opt.wallet_port)).await?;
-
-            let cm = hex::decode(note_commitment).expect("note commitment is hex encoded");
-            let request = tonic::Request::new(TransactionByNoteRequest { cm: cm.clone() });
-            tracing::info!("requesting tx by note commitment: {:?}", cm);
-            let response = client.transaction_by_note(request).await?;
-            tracing::info!("got response: {:?}", response);
-        }
-        Command::AssetLookup { asset_id } => {
-            let mut client =
-                WalletClient::connect(format!("http://{}:{}", opt.node, opt.wallet_port)).await?;
-            tracing::info!("requesting asset denom for asset id: {:?}", &asset_id,);
-            let request = tonic::Request::new(AssetLookupRequest { asset_id });
-            let asset = client.asset_lookup(request).await?.into_inner();
-
-            tracing::info!("got asset: {:?}", asset);
-        }
-        Command::AssetList {} => {
-            let mut client =
-                WalletClient::connect(format!("http://{}:{}", opt.node, opt.wallet_port)).await?;
-            tracing::info!("requesting asset list");
-            let request = tonic::Request::new(AssetListRequest {});
-
-            let mut stream = client.asset_list(request).await?.into_inner();
-
-            while let Some(asset) = stream.message().await? {
-                tracing::info!("got asset: {:?}", asset);
-            }
-        }
-        Command::Balance => {
-            let state = ClientStateFile::load(wallet_path)?;
-            let notes_by_asset = state.notes_by_asset_denomination();
-
-            let mut table = Table::new();
-            table.load_preset(presets::NOTHING);
-            table.set_header(vec!["Asset denomination", "Balance"]);
-            for (denom, notes) in notes_by_asset {
-                let note_amounts: Vec<u64> = notes.iter().map(|note| note.amount()).collect();
-                let balance: u64 = note_amounts.iter().sum();
-                table.add_row(vec![denom, balance.to_string()]);
-            }
-            println!("{}", table);
-        }
-        _ => todo!(),
+        Command::Tx(tx_cmd) => tx_cmd.exec(&opt, &mut state).await?,
+        Command::Addr(addr_cmd) => addr_cmd.exec(&mut state)?,
+        Command::Balance(balance_cmd) => balance_cmd.exec(&state)?,
+        Command::Validator(cmd) => cmd.exec(&opt, &state).await?,
+        Command::Stake(cmd) => cmd.exec(&opt, &mut state).await?,
+        Command::Tmp(cmd) => cmd.exec().await?,
     }
 
     Ok(())

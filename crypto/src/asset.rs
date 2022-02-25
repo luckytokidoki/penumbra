@@ -1,108 +1,131 @@
 //! Asset types and identifiers.
-use std::convert::{TryFrom, TryInto};
 
-use ark_ff::fields::PrimeField;
-use decaf377::FieldExt;
-use once_cell::sync::Lazy;
+mod cache;
+mod denom;
+mod id;
+mod registry;
 
-use crate::Fq;
-
-/// An identifier for an IBC asset type.
-///
-/// This is similar to, but different from, the design in [ADR001].  As in
-/// ADR001, a denomination trace is hashed to a fixed-size identifier, but
-/// unlike ADR001, we hash to a field element rather than a byte string.
-///
-/// A denomination trace looks like
-///
-/// - `denom` (native chain A asset)
-/// - `transfer/channelToA/denom` (chain B representation of chain A asset)
-/// - `transfer/channelToB/transfer/channelToA/denom` (chain C representation of chain B representation of chain A asset)
-///
-/// ADR001 defines the IBC asset ID as the SHA-256 hash of the denomination
-/// trace.  Instead, Penumbra hashes to a field element, so that asset IDs can
-/// be more easily used inside of a circuit.
-///
-/// [ADR001]:
-/// https://github.com/cosmos/ibc-go/blob/main/docs/architecture/adr-001-coin-source-tracing.md
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Id(pub Fq);
-
-impl std::fmt::Debug for Id {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use ark_ff::BigInteger;
-        let bytes = self.0.into_repr().to_bytes_le();
-        f.write_fmt(format_args!("asset::Id({})", hex::encode(&bytes)))
-    }
-}
-
-// XXX define a DenomTrace structure ?
-
-// xx rename this derive?
-impl From<&[u8]> for Id {
-    fn from(slice: &[u8]) -> Id {
-        // Convert an asset name to an asset ID by hashing to a scalar
-        Id(Fq::from_le_bytes_mod_order(
-            // XXX choice of hash function?
-            blake2b_simd::Params::default()
-                .personal(b"Penumbra_AssetID")
-                .hash(slice)
-                .as_bytes(),
-        ))
-    }
-}
-
-impl TryFrom<Vec<u8>> for Id {
-    type Error = anyhow::Error;
-
-    fn try_from(vec: Vec<u8>) -> Result<Id, Self::Error> {
-        let bytes: [u8; 32] = vec
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("vec not long enough to construct Asset ID"))?;
-        let inner = Fq::from_bytes(bytes)?;
-        Ok(Id(inner))
-    }
-}
-
-/// The domain separator used to hash asset ids to value generators.
-static VALUE_GENERATOR_DOMAIN_SEP: Lazy<Fq> = Lazy::new(|| {
-    Fq::from_le_bytes_mod_order(blake2b_simd::blake2b(b"penumbra.value.generator").as_bytes())
-});
-
-impl Id {
-    /// Compute the value commitment generator for this asset.
-    pub fn value_generator(&self) -> decaf377::Element {
-        decaf377::Element::map_to_group_cdh(&poseidon377::hash_1(
-            &VALUE_GENERATOR_DOMAIN_SEP,
-            self.0,
-        ))
-    }
-
-    /// Convert the asset ID to bytes.
-    pub fn to_bytes(&self) -> [u8; 32] {
-        self.0.to_bytes()
-    }
-}
+pub use cache::Cache;
+pub use denom::{Denom, Unit};
+pub use id::Id;
+pub use registry::{Registry, REGISTRY};
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     #[test]
-    fn make_up_some_fake_asset_ids() {
-        // marked for future deletion
-        // not really a test, just a way to exercise the code
+    fn test_registry_native_token() {
+        // We should be able to use `parse_base` with the valid base denomination.
+        let base_denom = REGISTRY.parse_denom("upenumbra").unwrap();
+        assert_eq!(format!("{}", base_denom), "upenumbra".to_string());
 
-        let pen_trace = b"pen";
-        let atom_trace = b"HubPort/HubChannel/atom";
+        // If we try to use `parse_base` with a display denomination, we should get `None`.
+        let display_denoms = vec!["mpenumbra", "penumbra"];
+        for display_denom in &display_denoms {
+            assert!(REGISTRY.parse_denom(display_denom).is_none());
+        }
 
-        let pen_id = Id::from(&pen_trace[..]);
-        let atom_id = Id::from(&atom_trace[..]);
+        // We should be able to use the display denominations with `parse_display` however.
+        for display_denom in display_denoms {
+            let parsed_display_denom = REGISTRY.parse_unit(display_denom);
 
-        dbg!(pen_id);
-        dbg!(atom_id);
+            assert_eq!(
+                format!("{}", parsed_display_denom.base()),
+                "upenumbra".to_string()
+            );
 
-        dbg!(pen_id.value_generator());
-        dbg!(atom_id.value_generator());
+            assert_eq!(format!("{}", parsed_display_denom), display_denom)
+        }
+
+        // The base denomination (upenumbra) can also be used for display purposes.
+        let parsed_display_denom = REGISTRY.parse_unit("upenumbra");
+        assert_eq!(
+            format!("{}", parsed_display_denom.base()),
+            "upenumbra".to_string()
+        );
+    }
+
+    #[test]
+    fn test_displaydenom_format_value() {
+        // with exponent 6, 1782000 formats to 1.782
+        let penumbra_display_denom = REGISTRY.parse_unit("penumbra");
+        assert_eq!(penumbra_display_denom.format_value(1782000), "1.782");
+        assert_eq!(penumbra_display_denom.format_value(6700001), "6.700001");
+        assert_eq!(penumbra_display_denom.format_value(1), "0.000001");
+
+        // with exponent 3, 1782000 formats to 1782
+        let mpenumbra_display_denom = REGISTRY.parse_unit("mpenumbra");
+        assert_eq!(mpenumbra_display_denom.format_value(1782000), "1782");
+
+        // with exponent 0, 1782000 formats to 1782000
+        let upenumbra_display_denom = REGISTRY.parse_unit("upenumbra");
+        assert_eq!(upenumbra_display_denom.format_value(1782000), "1782000");
+    }
+
+    #[test]
+    fn best_unit_for() {
+        let base_denom = REGISTRY.parse_denom("upenumbra").unwrap();
+
+        assert_eq!(base_denom.best_unit_for(0).to_string(), "upenumbra");
+        assert_eq!(base_denom.best_unit_for(999).to_string(), "upenumbra");
+        assert_eq!(base_denom.best_unit_for(1_000).to_string(), "mpenumbra");
+        assert_eq!(base_denom.best_unit_for(999_999).to_string(), "mpenumbra");
+        assert_eq!(base_denom.best_unit_for(1_000_000).to_string(), "penumbra");
+    }
+
+    #[test]
+    fn test_displaydenom_parse_value() {
+        let penumbra_display_denom = REGISTRY.parse_unit("penumbra");
+        assert!(penumbra_display_denom.parse_value("1.2.3").is_err());
+
+        assert_eq!(
+            penumbra_display_denom.parse_value("1.782").unwrap(),
+            1782000
+        );
+        assert_eq!(
+            penumbra_display_denom.parse_value("6.700001").unwrap(),
+            6700001
+        );
+
+        let mpenumbra_display_denom = REGISTRY.parse_unit("mpenumbra");
+        assert_eq!(
+            mpenumbra_display_denom.parse_value("1782").unwrap(),
+            1782000
+        );
+        assert!(mpenumbra_display_denom.parse_value("1782.0001").is_err());
+
+        let upenumbra_display_denom = REGISTRY.parse_unit("upenumbra");
+        assert_eq!(
+            upenumbra_display_denom.parse_value("1782000").unwrap(),
+            1782000
+        );
+    }
+
+    #[test]
+    fn test_registry_fallthrough() {
+        // We should be able to use `parse_base` with a base denomination for assets
+        // not included in the hardcoded registry.
+        let base_denom = REGISTRY.parse_denom("cube").unwrap();
+        assert_eq!(format!("{}", base_denom), "cube".to_string());
+    }
+
+    proptest! {
+        #[test]
+        fn displaydenom_parsing_formatting_roundtrip(
+            v: u32
+        ) {
+            let penumbra_display_denom = REGISTRY.parse_unit("penumbra");
+            let formatted = penumbra_display_denom.format_value(v.into());
+            let parsed = penumbra_display_denom.parse_value(&formatted);
+            assert_eq!(v, parsed.unwrap() as u32);
+
+            let mpenumbra_display_denom = REGISTRY.parse_unit("mpenumbra");
+            let formatted = mpenumbra_display_denom.format_value(v.into());
+            let parsed = mpenumbra_display_denom.parse_value(&formatted);
+            assert_eq!(v, parsed.unwrap() as u32);
+        }
     }
 }

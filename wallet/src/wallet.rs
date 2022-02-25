@@ -1,11 +1,11 @@
-use rand_core::{CryptoRng, RngCore};
-use serde::{Deserialize, Serialize};
-
+use anyhow::Context;
 use penumbra_crypto::{
     fmd,
-    keys::{FullViewingKey, IncomingViewingKey, SpendKey},
-    Address,
+    keys::{FullViewingKey, IncomingViewingKey, OutgoingViewingKey, SpendKey, SpendSeed},
+    Address, Note,
 };
+use rand_core::{CryptoRng, RngCore};
+use serde::{Deserialize, Serialize};
 
 /// The contents of the wallet file that share a spend authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,9 +28,28 @@ impl Wallet {
         }
     }
 
+    /// Imports a wallet from a [`SpendSeed`].
+    pub fn import(spend_seed: SpendSeed) -> Self {
+        let spend_key = spend_seed.into();
+        Self {
+            spend_key,
+            address_labels: vec!["Default".to_string()],
+        }
+    }
+
     /// Incoming viewing key from this spend seed.
     pub fn incoming_viewing_key(&self) -> &IncomingViewingKey {
         self.spend_key.full_viewing_key().incoming()
+    }
+
+    /// Outgoing viewing key from this spend seed.
+    pub fn outgoing_viewing_key(&self) -> &OutgoingViewingKey {
+        self.spend_key.full_viewing_key().outgoing()
+    }
+
+    /// Returns the wallet's spend seed.
+    pub fn spend_key(&self) -> &SpendKey {
+        &self.spend_key
     }
 
     /// Get the full viewing key for this wallet.
@@ -48,6 +67,16 @@ impl Wallet {
         (next_index, address, dtk)
     }
 
+    /// Get address by index.
+    pub fn address_by_index(&self, index: usize) -> Result<(String, Address), anyhow::Error> {
+        let label = self
+            .address_labels
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("no address with index {}", index))?;
+        let (address, _dtk) = self.incoming_viewing_key().payment_address(index.into());
+        Ok((label.clone(), address))
+    }
+
     /// Iterate through the addresses in this wallet.
     pub fn addresses(&self) -> impl Iterator<Item = (usize, String, Address)> {
         let incoming = self.incoming_viewing_key().clone();
@@ -61,12 +90,25 @@ impl Wallet {
                 (index, label, address)
             })
     }
+
+    /// Computes the change address for the given note.
+    pub fn change_address(&self, note: &Note) -> Result<Address, anyhow::Error> {
+        let index: u64 = self
+            .incoming_viewing_key()
+            .index_for_diversifier(&note.diversifier())
+            .try_into()
+            .context("cannot convert DiversifierIndex to u64")?;
+
+        let (_label, address) = self.address_by_index(index as usize)?;
+        Ok(address)
+    }
 }
 
 mod serde_helpers {
-    use super::*;
     use penumbra_crypto::keys::SpendSeed;
     use serde_with::serde_as;
+
+    use super::*;
 
     #[serde_as]
     #[derive(Deserialize, Serialize)]

@@ -1,10 +1,11 @@
+use std::convert::{TryFrom, TryInto};
+
 use anyhow::anyhow;
 use chacha20poly1305::{
     aead::{Aead, NewAead},
     ChaCha20Poly1305, Key, Nonce,
 };
 use once_cell::sync::Lazy;
-use std::convert::TryInto;
 
 use crate::{ka, keys::IncomingViewingKey, note::derive_symmetric_key, Address};
 
@@ -26,6 +27,20 @@ pub struct MemoPlaintext(pub [u8; MEMO_LEN_BYTES]);
 impl Default for MemoPlaintext {
     fn default() -> MemoPlaintext {
         MemoPlaintext([0u8; MEMO_LEN_BYTES])
+    }
+}
+
+impl TryFrom<String> for MemoPlaintext {
+    type Error = anyhow::Error;
+
+    fn try_from(input: String) -> Result<MemoPlaintext, Self::Error> {
+        if input.len() > MEMO_LEN_BYTES {
+            return Err(anyhow::anyhow!("provided memo exceeds maximum memo size"));
+        }
+        let mut mp = [0u8; MEMO_LEN_BYTES];
+        mp[..input.len()].copy_from_slice(input.as_bytes());
+
+        Ok(MemoPlaintext(mp))
     }
 }
 
@@ -77,15 +92,15 @@ impl MemoPlaintext {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MemoCiphertext(pub [u8; MEMO_CIPHERTEXT_LEN_BYTES]);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::keys::SpendKey;
     use rand_core::OsRng;
+
+    use super::*;
+    use crate::keys::SpendKey;
 
     #[test]
     fn test_memo_encryption_and_decryption() {

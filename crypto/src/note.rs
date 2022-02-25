@@ -1,4 +1,6 @@
-use ark_ff::PrimeField;
+use std::convert::{TryFrom, TryInto};
+
+use ark_ff::{PrimeField, UniformRand};
 use blake2b_simd;
 use chacha20poly1305::{
     aead::{Aead, NewAead},
@@ -6,8 +8,9 @@ use chacha20poly1305::{
 };
 use decaf377::FieldExt;
 use once_cell::sync::Lazy;
+use penumbra_proto::crypto as pb;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
 use thiserror;
 
 use crate::{
@@ -65,7 +68,7 @@ pub enum Error {
 }
 
 impl Note {
-    pub fn new(
+    pub fn from_parts(
         diversifier: Diversifier,
         transmission_key: ka::Public,
         value: Value,
@@ -79,6 +82,16 @@ impl Note {
             transmission_key_s: Fq::from_bytes(transmission_key.0)
                 .map_err(|_| Error::InvalidTransmissionKey)?,
         })
+    }
+
+    /// Generate a fresh note representing the given value for the given destination address, with a
+    /// random blinding factor.
+    pub fn generate(rng: &mut impl Rng, address: &crate::Address, value: Value) -> Self {
+        let diversifier = *address.diversifier();
+        let transmission_key = *address.transmission_key();
+        let note_blinding = Fq::rand(rng);
+        Note::from_parts(diversifier, transmission_key, value, note_blinding)
+            .expect("transmission key in address is always valid")
     }
 
     pub fn diversified_generator(&self) -> decaf377::Element {
@@ -287,7 +300,7 @@ impl TryFrom<&[u8]> for Note {
             .try_into()
             .map_err(|_| Error::NoteDeserializationError)?;
 
-        Note::new(
+        Note::from_parts(
             bytes[1..12]
                 .try_into()
                 .map_err(|_| Error::NoteDeserializationError)?,
@@ -314,9 +327,62 @@ impl TryFrom<[u8; NOTE_LEN_BYTES]> for Note {
 }
 
 // Note commitment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(into = "[u8; 32]", try_from = "[u8; 32]")]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(into = "pb::NoteCommitment", try_from = "pb::NoteCommitment")]
 pub struct Commitment(pub Fq);
+
+#[cfg(test)]
+mod test_serde {
+    use super::Commitment;
+
+    #[test]
+    fn roundtrip_json_zero() {
+        let commitment = Commitment::try_from([0; 32]).unwrap();
+        let bytes = serde_json::to_vec(&commitment).unwrap();
+        println!("{:?}", bytes);
+        let deserialized: Commitment = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(commitment, deserialized);
+    }
+
+    #[test]
+    fn roundtrip_bincode_zero() {
+        let commitment = Commitment::try_from([0; 32]).unwrap();
+        let bytes = bincode::serialize(&commitment).unwrap();
+        println!("{:?}", bytes);
+        let deserialized: Commitment = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(commitment, deserialized);
+    }
+}
+
+impl From<Commitment> for pb::NoteCommitment {
+    fn from(nc: Commitment) -> Self {
+        Self {
+            inner: nc.0.to_bytes().to_vec(),
+        }
+    }
+}
+
+impl TryFrom<pb::NoteCommitment> for Commitment {
+    type Error = anyhow::Error;
+    fn try_from(value: pb::NoteCommitment) -> Result<Self, Self::Error> {
+        let bytes: [u8; 32] = value.inner[..]
+            .try_into()
+            .map_err(|_| Error::InvalidNoteCommitment)?;
+
+        let inner = Fq::from_bytes(bytes).map_err(|_| Error::InvalidNoteCommitment)?;
+
+        Ok(Commitment(inner))
+    }
+}
+
+impl std::fmt::Debug for Commitment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "note::Commitment({})",
+            hex::encode(&self.0.to_bytes()[..])
+        ))
+    }
+}
 
 impl Commitment {
     pub fn new(
@@ -346,12 +412,6 @@ impl From<Commitment> for [u8; 32] {
     }
 }
 
-impl Into<Vec<u8>> for Commitment {
-    fn into(self) -> Vec<u8> {
-        self.0.to_bytes().to_vec()
-    }
-}
-
 impl TryFrom<[u8; 32]> for Commitment {
     type Error = Error;
 
@@ -362,6 +422,7 @@ impl TryFrom<[u8; 32]> for Commitment {
     }
 }
 
+// TODO: remove? aside from sqlx is there a use case for non-proto conversion from byte slices?
 impl TryFrom<&[u8]> for Commitment {
     type Error = Error;
 
@@ -378,9 +439,9 @@ impl TryFrom<&[u8]> for Commitment {
 
 #[cfg(feature = "sqlx")]
 mod sqlx_impls {
-    use super::*;
-
     use sqlx::{Database, Decode, Encode, Postgres, Type};
+
+    use super::*;
 
     impl<'r> Decode<'r, Postgres> for Commitment {
         fn decode(
@@ -410,11 +471,10 @@ mod sqlx_impls {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::keys::SpendKey;
-    use ark_ff::UniformRand;
     use rand_core::OsRng;
+
+    use super::*;
+    use crate::keys::SpendKey;
 
     #[test]
     fn test_note_encryption_and_decryption() {
@@ -427,15 +487,9 @@ mod tests {
 
         let value = Value {
             amount: 10,
-            asset_id: b"pen".as_ref().into(),
+            asset_id: asset::REGISTRY.parse_denom("upenumbra").unwrap().id(),
         };
-        let note = Note::new(
-            *dest.diversifier(),
-            *dest.transmission_key(),
-            value,
-            Fq::rand(&mut rng),
-        )
-        .expect("can create note");
+        let note = Note::generate(&mut rng, &dest, value);
         let esk = ka::Secret::new(&mut rng);
 
         let ciphertext = note.encrypt(&esk);

@@ -21,27 +21,29 @@ COPY pd/build.rs ./pd
 # TODO If the protobuf definitions, crypto, or wallet implementations change,
 # there will be a complete rebuild. This is maybe possible to avoid.
 COPY proto ./proto
+COPY chain ./chain
 COPY crypto ./crypto
+COPY stake ./stake
 COPY decaf377-fmd ./decaf377-fmd
 COPY decaf377-ka ./decaf377-ka
+COPY transaction ./transaction
 COPY wallet ./wallet
 COPY .git ./.git
 # Sorry about all that mess ^, but it's worth it during development.
 
 # Fetch dependencies in a separate layer, so that they can be cached.
-COPY Cargo.lock .
-RUN cargo fetch --locked
+RUN cargo fetch
 
-RUN cargo build --bin pd --frozen
+RUN cargo build --bin pd
 
 # Remove the cached builds of internal packages.
-RUN rm -rf pcli pd crypto wallet config
+RUN rm -rf pcli pd crypto wallet config stake
 
 # Copy the repo source now that dependencies have been built and cached.
 COPY . .
 
 # For dev leave off the `--release` flag as well for faster builds.
-RUN cargo build --bin pd --frozen && \
+RUN cargo build --bin pd && \
     mkdir -p /out && \
     mv target/debug/pd /out/pd
 
@@ -51,7 +53,7 @@ RUN cargo build --bin pd --frozen && \
 # `scratch` image rather than Debian or Alpine. However, then we'd have to build
 # with a statically linked libc (read: musl), and musl's malloc exhibits
 # pathologically poor performance for Tokio applications...
-FROM debian:buster-slim as runtime
+FROM debian:bullseye-slim as runtime
 ARG DATABASE_URL
 ENV DATABASE_URL=$DATABASE_URL
 WORKDIR /penumbra

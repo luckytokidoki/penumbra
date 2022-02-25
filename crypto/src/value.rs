@@ -1,22 +1,51 @@
 //! Values (?)
 
-use std::convert::{TryFrom, TryInto};
-use std::ops::Deref;
-use thiserror;
+use std::{
+    convert::{TryFrom, TryInto},
+    ops::Deref,
+    str::FromStr,
+};
 
 use ark_ff::PrimeField;
 use once_cell::sync::Lazy;
+use penumbra_proto::crypto as pb;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use thiserror;
 
 use crate::{asset, Fq, Fr};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Copy, Clone, Debug, PartialEq, Eq)]
+#[serde(try_from = "pb::Value", into = "pb::Value")]
 pub struct Value {
     pub amount: u64,
     // The asset ID. 256 bits.
     pub asset_id: asset::Id,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+impl From<Value> for pb::Value {
+    fn from(v: Value) -> Self {
+        pb::Value {
+            amount: v.amount,
+            asset_id: Some(v.asset_id.into()),
+        }
+    }
+}
+
+impl TryFrom<pb::Value> for Value {
+    type Error = anyhow::Error;
+    fn try_from(value: pb::Value) -> Result<Self, Self::Error> {
+        Ok(Value {
+            amount: value.amount,
+            asset_id: value
+                .asset_id
+                .ok_or_else(|| anyhow::anyhow!("missing value commitment"))?
+                .try_into()?,
+        })
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct Commitment(pub decaf377::Element);
 
 pub static VALUE_BLINDING_GENERATOR: Lazy<decaf377::Element> = Lazy::new(|| {
@@ -41,6 +70,44 @@ impl Value {
 
         Commitment(C)
     }
+
+    /// Use the provided [`asset::Cache`] to format this value.
+    ///
+    /// Returns `None` if the denomination is not known.
+    pub fn try_format(&self, cache: &asset::Cache) -> Option<String> {
+        cache.get(&self.asset_id).map(|base_denom| {
+            let display_denom = base_denom.best_unit_for(self.amount);
+            format!(
+                "{}{}",
+                display_denom.format_value(self.amount),
+                display_denom
+            )
+        })
+    }
+}
+
+impl FromStr for Value {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let re = Regex::new(r"^([0-9.]+)([^0-9.].*)$").unwrap();
+
+        if let Some(captures) = re.captures(s) {
+            let numeric_str = captures.get(1).expect("matched regex").as_str();
+            let denom_str = captures.get(2).expect("matched regex").as_str();
+
+            let display_denom = asset::REGISTRY.parse_unit(denom_str);
+            let amount = display_denom.parse_value(numeric_str)?;
+            let asset_id = display_denom.base().id();
+
+            Ok(Value { amount, asset_id })
+        } else {
+            Err(anyhow::anyhow!(
+                "could not parse {} as a value; provide both a numeric value and denomination, e.g. 1penumbra",
+                s
+            ))
+        }
+    }
 }
 
 impl std::ops::Add<Commitment> for Commitment {
@@ -54,6 +121,13 @@ impl std::ops::Sub<Commitment> for Commitment {
     type Output = Commitment;
     fn sub(self, rhs: Commitment) -> Self::Output {
         Commitment(self.0 - rhs.0)
+    }
+}
+
+impl std::ops::Neg for Commitment {
+    type Output = Commitment;
+    fn neg(self) -> Self::Output {
+        Commitment(-self.0)
     }
 }
 
@@ -99,11 +173,13 @@ mod tests {
     fn sum_value_commitments() {
         use ark_ff::Field;
 
-        let pen_trace = b"pen";
-        let atom_trace = b"HubPort/HubChannel/atom";
+        let pen_denom = asset::REGISTRY.parse_denom("upenumbra").unwrap();
+        let atom_denom = asset::REGISTRY
+            .parse_denom("HubPort/HubChannel/uatom")
+            .unwrap();
 
-        let pen_id = asset::Id::from(&pen_trace[..]);
-        let atom_id = asset::Id::from(&atom_trace[..]);
+        let pen_id = asset::Id::from(pen_denom);
+        let atom_id = asset::Id::from(atom_denom);
 
         // some values of different types
         let v1 = Value {
@@ -154,5 +230,50 @@ mod tests {
 
         // so c0 = 0 * G_v1 + 0 * G_v2 + b0 * H
         assert_eq!(c0.0, b0 * VALUE_BLINDING_GENERATOR.deref());
+    }
+
+    #[test]
+    fn value_parsing_happy() {
+        let upenumbra_base_denom = asset::REGISTRY.parse_denom("upenumbra").unwrap();
+        let nala_base_denom = asset::REGISTRY.parse_denom("nala").unwrap();
+        let cache = [upenumbra_base_denom.clone(), nala_base_denom.clone()]
+            .into_iter()
+            .collect::<asset::Cache>();
+
+        let v1: Value = "1823.298penumbra".parse().unwrap();
+        assert_eq!(v1.amount, 1823298000);
+        assert_eq!(v1.asset_id, upenumbra_base_denom.id());
+        // Check that we can also parse the output of try_format
+        assert_eq!(v1, v1.try_format(&cache).unwrap().parse().unwrap());
+
+        let v2: Value = "3930upenumbra".parse().unwrap();
+        assert_eq!(v2.amount, 3930);
+        assert_eq!(v2.asset_id, upenumbra_base_denom.id());
+        assert_eq!(v2, v2.try_format(&cache).unwrap().parse().unwrap());
+
+        let v1: Value = "1nala".parse().unwrap();
+        assert_eq!(v1.amount, 1);
+        assert_eq!(v1.asset_id, nala_base_denom.id());
+        assert_eq!(v1, v1.try_format(&cache).unwrap().parse().unwrap());
+    }
+
+    #[test]
+    fn value_parsing_errors() {
+        assert!(Value::from_str("1").is_err());
+        assert!(Value::from_str("nala").is_err());
+    }
+
+    #[test]
+    fn try_format_picks_best_unit() {
+        let upenumbra_base_denom = asset::REGISTRY.parse_denom("upenumbra").unwrap();
+        let cache = [upenumbra_base_denom].into_iter().collect::<asset::Cache>();
+
+        let v1: Value = "999upenumbra".parse().unwrap();
+        let v2: Value = "1000upenumbra".parse().unwrap();
+        let v3: Value = "4000000upenumbra".parse().unwrap();
+
+        assert_eq!(v1.try_format(&cache).unwrap(), "999upenumbra");
+        assert_eq!(v2.try_format(&cache).unwrap(), "1mpenumbra");
+        assert_eq!(v3.try_format(&cache).unwrap(), "4penumbra");
     }
 }

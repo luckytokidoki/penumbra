@@ -41,7 +41,9 @@ jobs:
           # indexes is overwritten on each cargo doc invocation.
           cargo doc --no-deps \
             -p tendermint \
+            -p tower-abci \
             -p incrementalmerkletree \
+            -p jmt \
             -p ark-ff \
             -p ark-serialize \
             -p ark-sponge \
@@ -50,11 +52,14 @@ jobs:
             -p decaf377-ka \
             -p decaf377-rdsa \
             -p decaf377-fmd \
-            -p penumbra-crypto \
             -p penumbra-proto \
+            -p penumbra-crypto \
+            -p penumbra-stake \
+            -p penumbra-chain \
+            -p penumbra-transaction \
             -p penumbra-wallet \
             -p pd \
-            -p pcli \
+            -p pcli
       - name: Move API docs to subdirectory
         run: |
           if [ -d "firebase-tmp" ]; then rm -rf firebase-tmp; fi
