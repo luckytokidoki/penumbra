@@ -1,8 +1,8 @@
-use std::{fs::File, io::BufReader, path::PathBuf};
+use std::{fs::File, io::BufReader, path::PathBuf, str::FromStr};
 
 use anyhow::{anyhow, Context as _, Result};
 use directories::ProjectDirs;
-use penumbra_crypto::keys::SpendSeed;
+use penumbra_crypto::keys::{SeedPhrase, SpendSeed};
 use penumbra_wallet::{ClientState, Wallet};
 use rand_core::OsRng;
 use serde::Deserialize;
@@ -18,9 +18,14 @@ pub enum WalletCmd {
         /// A 32-byte hex string encoding the spend seed.
         spend_seed: String,
     },
+    /// Import from an existing seed phrase.
+    ImportFromPhrase {
+        /// A 24 word phrase in quotes.
+        seed_phrase: String,
+    },
     /// Export the spend seed for the wallet.
     Export,
-    /// Generate a new spend seed.
+    /// Generate a new seed phrase.
     Generate,
     /// Keep the spend seed, but reset all other client state.
     Reset,
@@ -33,6 +38,7 @@ impl WalletCmd {
     pub fn needs_sync(&self) -> bool {
         match self {
             WalletCmd::Import { .. } => false,
+            WalletCmd::ImportFromPhrase { .. } => false,
             WalletCmd::Export => false,
             WalletCmd::Generate => false,
             WalletCmd::Reset => false,
@@ -45,12 +51,26 @@ impl WalletCmd {
         // wallet state to be saved to disk
         let state = match self {
             // These two commands return new wallets to be saved to disk:
-            WalletCmd::Generate => Some(ClientState::new(Wallet::generate(&mut OsRng))),
+            WalletCmd::Generate => {
+                let seed_phrase = SeedPhrase::generate(&mut OsRng);
+
+                // xxx: Something better should be done here, this is in danger of being
+                // shared by users accidentally in log output.
+                println!(
+                    "YOUR PRIVATE SEED PHRASE: {}\nDO NOT SHARE WITH ANYONE!",
+                    seed_phrase
+                );
+
+                Some(ClientState::new(Wallet::from_seed_phrase(seed_phrase)))
+            }
             WalletCmd::Import { spend_seed } => {
                 let seed = hex::decode(spend_seed)?;
                 let seed = SpendSeed::try_from(seed.as_slice())?;
                 Some(ClientState::new(Wallet::import(seed)))
             }
+            WalletCmd::ImportFromPhrase { seed_phrase } => Some(ClientState::new(
+                Wallet::from_seed_phrase(SeedPhrase::from_str(seed_phrase)?),
+            )),
             // The rest of these commands don't require a wallet state to be saved to disk:
             WalletCmd::Export => {
                 let state = ClientStateFile::load(wallet_path.clone())?;

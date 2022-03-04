@@ -4,9 +4,14 @@ use std::{
     path::PathBuf,
 };
 
+use anyhow::Context;
 use metrics_exporter_prometheus::PrometheusBuilder;
+use pd::genesis::Allocation;
 use penumbra_chain::params::ChainParams;
-use penumbra_crypto::rdsa::{SigningKey, SpendAuth, VerificationKey};
+use penumbra_crypto::{
+    keys::{SpendKey, SpendSeed},
+    rdsa::{SigningKey, SpendAuth, VerificationKey},
+};
 use penumbra_proto::{
     light_wallet::light_wallet_server::LightWalletServer,
     thin_wallet::thin_wallet_server::ThinWalletServer,
@@ -59,10 +64,10 @@ enum Command {
         #[structopt(long, default_value = "4")]
         num_validator_nodes: usize,
         /// Number of blocks per epoch.
-        #[structopt(long, default_value = "60")]
+        #[structopt(long, default_value = "40")]
         epoch_duration: u64,
         /// Number of epochs before unbonding stake is released.
-        #[structopt(long, default_value = "60")]
+        #[structopt(long, default_value = "40")]
         unbonding_epochs: u64,
         /// Maximum number of validators in the consensus set.
         #[structopt(long, default_value = "10")]
@@ -71,26 +76,18 @@ enum Command {
         /// Expressed in basis points.
         #[structopt(long, default_value = "1000")]
         slashing_penalty: u64,
-        /// Path to CSV file containing initial allocations.
-        #[structopt(
-            long,
-            parse(from_os_str),
-            default_value = "testnets/004-thelxinoe/allocations.csv"
-        )]
-        allocations_input_file: PathBuf,
-        /// Path to JSON file containing initial validator configs.
-        #[structopt(
-            long,
-            parse(from_os_str),
-            default_value = "testnets/004-thelxinoe/validators.json"
-        )]
-        validators_input_file: PathBuf,
+        /// Path to CSV file containing initial allocations [default: latest testnet].
+        #[structopt(long, parse(from_os_str))]
+        allocations_input_file: Option<PathBuf>,
+        /// Path to JSON file containing initial validator configs [default: latest testnet].
+        #[structopt(long, parse(from_os_str))]
+        validators_input_file: Option<PathBuf>,
         /// Path to directory to store output in. Must not exist.
         #[structopt(long)]
         output_dir: Option<PathBuf>,
-        /// Testnet name, e.g. `penumbra-euporie`
-        #[structopt(long, default_value = "penumbra-thelxinoe")]
-        chain_id: String,
+        /// Testnet name [default: latest testnet].
+        #[structopt(long)]
+        chain_id: Option<String>,
         /// IP Address to start `tendermint` nodes on. Increments by three to make room for `pd` and `postgres` per node.
         #[structopt(long, default_value = "192.167.10.2")]
         starting_ip: Ipv4Addr,
@@ -223,6 +220,9 @@ async fn main() -> anyhow::Result<()> {
                 time::{Duration, SystemTime, UNIX_EPOCH},
             };
 
+            // Build script computes the latest testnet name and sets it as an env variable
+            let chain_id = chain_id.unwrap_or_else(|| env!("PD_LATEST_TESTNET_NAME").to_string());
+
             let randomizer = OsRng.gen::<u32>();
             let chain_id = format!("{}-{}", chain_id, hex::encode(&randomizer.to_le_bytes()));
 
@@ -252,11 +252,48 @@ async fn main() -> anyhow::Result<()> {
                 None => canonicalize_path("~/.penumbra/testnet_data"),
             };
 
-            // Parse allocations from input file
-            let allocations = parse_allocations_file(allocations_input_file)?;
+            // Parse allocations from input file or default to latest testnet allocations computed
+            // in the build script
+            let mut allocations = if let Some(allocations_input_file) = allocations_input_file {
+                let allocations_file = File::open(&allocations_input_file)
+                    .with_context(|| format!("cannot open file {:?}", allocations_input_file))?;
+                parse_allocations(allocations_file).with_context(|| {
+                    format!(
+                        "could not parse allocations file {:?}",
+                        allocations_input_file
+                    )
+                })?
+            } else {
+                static LATEST_ALLOCATIONS: &str =
+                    include_str!(env!("PD_LATEST_TESTNET_ALLOCATIONS"));
+                parse_allocations(std::io::Cursor::new(LATEST_ALLOCATIONS)).with_context(|| {
+                    format!(
+                        "could not parse default latest testnet allocations file {:?}",
+                        env!("PD_LATEST_TESTNET_ALLOCATIONS")
+                    )
+                })?
+            };
 
-            // Parse validators from input file
-            let validators = parse_validators_file(validators_input_file)?;
+            // Parse validators from input file or default to latest testnet validators computed in
+            // the build script
+            let validators = if let Some(validators_input_file) = validators_input_file {
+                let validators_file = File::open(&validators_input_file)
+                    .with_context(|| format!("cannot open file {:?}", validators_input_file))?;
+                parse_validators(validators_file).with_context(|| {
+                    format!(
+                        "could not parse validators file {:?}",
+                        validators_input_file
+                    )
+                })?
+            } else {
+                static LATEST_VALIDATORS: &str = include_str!(env!("PD_LATEST_TESTNET_VALIDATORS"));
+                parse_validators(std::io::Cursor::new(LATEST_VALIDATORS)).with_context(|| {
+                    format!(
+                        "could not parse default latest testnet validators file {:?}",
+                        env!("PD_LATEST_TESTNET_VALIDATORS")
+                    )
+                })?
+            };
 
             struct ValidatorKeys {
                 // Penumbra spending key and viewing key for this node.
@@ -269,13 +306,18 @@ async fn main() -> anyhow::Result<()> {
                 pub node_key_sk: tendermint::PrivateKey,
                 #[allow(unused_variables, dead_code)]
                 pub node_key_pk: tendermint::PublicKey,
+                pub validator_spendseed: SpendSeed,
             }
             let mut validator_keys = Vec::<ValidatorKeys>::new();
             // Generate a keypair for each validator
             for _ in 0..num_validator_nodes {
-                // Create spending key and viewing key for this node.
-                let validator_id_sk = SigningKey::<SpendAuth>::new(OsRng);
-                let validator_id_vk = VerificationKey::from(&validator_id_sk);
+                // Create the spend key for this node.
+                let seed = SpendSeed(OsRng.gen());
+                let spend_key = SpendKey::from(seed.clone());
+
+                // Create signing key and verification key for this node.
+                let validator_id_sk = spend_key.spend_auth_key();
+                let validator_id_vk = VerificationKey::from(validator_id_sk);
 
                 // generate consensus key for tendermint.
                 let validator_cons_sk =
@@ -288,13 +330,27 @@ async fn main() -> anyhow::Result<()> {
                 let node_key_pk = node_key_sk.public_key();
 
                 let vk = ValidatorKeys {
-                    validator_id_sk,
+                    validator_id_sk: validator_id_sk.clone(),
                     validator_id_vk,
                     validator_cons_sk,
                     validator_cons_pk,
                     node_key_sk,
                     node_key_pk,
+                    validator_spendseed: seed,
                 };
+
+                let fvk = spend_key.full_viewing_key();
+                let ivk = fvk.incoming();
+                let (dest, _dtk_d) = ivk.payment_address(0u64.into());
+
+                // Add a default 1 upenumbra allocation to the validator.
+                let identity_key: IdentityKey = IdentityKey(fvk.spend_verification_key().clone());
+                let delegation_denom = identity_key.delegation_token().denom();
+                allocations.push(Allocation {
+                    address: dest,
+                    amount: 1,
+                    denom: delegation_denom.to_string(),
+                });
 
                 validator_keys.push(vk);
             }
@@ -303,13 +359,16 @@ async fn main() -> anyhow::Result<()> {
                 let node_name = format!("node{}", n);
 
                 let app_state = genesis::AppState {
-                    allocations: allocations.iter().map(|a| a.into()).collect(),
+                    allocations: allocations.clone(),
                     chain_params: ChainParams {
                         chain_id: chain_id.clone(),
                         epoch_duration,
                         unbonding_epochs,
                         active_validator_limit,
                         slashing_penalty,
+                        ibc_enabled: false,
+                        inbound_ics20_transfers_enabled: false,
+                        outbound_ics20_transfers_enabled: false,
                     },
                     validators: validators
                         .iter()
@@ -353,10 +412,10 @@ async fn main() -> anyhow::Result<()> {
                 node_dir.push(&node_name);
 
                 let mut node_config_dir = node_dir.clone();
-                node_config_dir.push("config".to_string());
+                node_config_dir.push("config");
 
                 let mut node_data_dir = node_dir.clone();
-                node_data_dir.push("data".to_string());
+                node_data_dir.push("data");
 
                 fs::create_dir_all(&node_config_dir)?;
                 fs::create_dir_all(&node_data_dir)?;
@@ -489,6 +548,18 @@ async fn main() -> anyhow::Result<()> {
                 let mut validator_signingkey_file = File::create(validator_signingkey_file_path)?;
                 validator_signingkey_file
                     .write_all(serde_json::to_string_pretty(&vk.validator_id_sk)?.as_bytes())?;
+
+                // Write the validator's spend seed:
+                let mut validator_spendseed_file_path = node_config_dir.clone();
+                validator_spendseed_file_path.push("validator_spendseed.json");
+                println!(
+                    "Writing {} validator spend seed file to: {}",
+                    &node_name,
+                    validator_spendseed_file_path.display()
+                );
+                let mut validator_spendseed_file = File::create(validator_spendseed_file_path)?;
+                validator_spendseed_file
+                    .write_all(serde_json::to_string_pretty(&vk.validator_spendseed)?.as_bytes())?;
 
                 println!("-------------------------------------");
             }

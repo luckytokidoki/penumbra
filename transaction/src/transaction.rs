@@ -4,7 +4,7 @@ use ark_ff::Zero;
 use bytes::Bytes;
 use decaf377::FieldExt;
 use penumbra_crypto::{
-    merkle::{self, NoteCommitmentTree, TreeExt},
+    merkle,
     rdsa::{Binding, Signature, VerificationKey, VerificationKeyBytes},
     Fr, Value,
 };
@@ -17,7 +17,7 @@ use penumbra_proto::{
 use penumbra_stake::STAKING_TOKEN_ASSET_ID;
 
 // TODO: remove & replace with anyhow
-use crate::{action::error::ProtoError, Action, GenesisBuilder};
+use crate::{action::error::ProtoError, Action};
 
 mod builder;
 pub use builder::Builder;
@@ -62,21 +62,6 @@ impl Transaction {
             outputs: Vec::new(),
             delegations: Vec::new(),
             undelegations: Vec::new(),
-            fee: None,
-            synthetic_blinding_factor: Fr::zero(),
-            value_balance: decaf377::Element::default(),
-            value_commitments: decaf377::Element::default(),
-            merkle_root,
-            expiry_height: None,
-            chain_id: None,
-        }
-    }
-
-    /// Build the genesis transactions.
-    pub fn genesis_builder() -> GenesisBuilder {
-        let merkle_root = NoteCommitmentTree::new(0).root2();
-        GenesisBuilder {
-            actions: Vec::new(),
             fee: None,
             synthetic_blinding_factor: Fr::zero(),
             value_balance: decaf377::Element::default(),
@@ -275,7 +260,11 @@ impl From<ProtoFee> for Fee {
 
 #[cfg(test)]
 mod tests {
-    use penumbra_crypto::{keys::SpendKey, memo::MemoPlaintext, Fq, Value};
+    use penumbra_crypto::{
+        keys::{SeedPhrase, SpendKey, SpendSeed},
+        memo::MemoPlaintext,
+        Fq, Value,
+    };
     use rand_core::OsRng;
 
     use super::*;
@@ -284,11 +273,15 @@ mod tests {
     #[test]
     fn test_transaction_single_output_fails_due_to_nonzero_value_balance() {
         let mut rng = OsRng;
-        let sk_sender = SpendKey::generate(&mut rng);
+        let seed_phrase = SeedPhrase::generate(&mut rng);
+        let spend_seed = SpendSeed::from_seed_phrase(seed_phrase, 0);
+        let sk_sender = SpendKey::new(spend_seed);
         let fvk_sender = sk_sender.full_viewing_key();
         let ovk_sender = fvk_sender.outgoing();
 
-        let sk_recipient = SpendKey::generate(&mut rng);
+        let seed_phrase = SeedPhrase::generate(&mut rng);
+        let spend_seed = SpendSeed::from_seed_phrase(seed_phrase, 0);
+        let sk_recipient = SpendKey::new(spend_seed);
         let fvk_recipient = sk_recipient.full_viewing_key();
         let ivk_recipient = fvk_recipient.incoming();
         let (dest, _dtk_d) = ivk_recipient.payment_address(0u64.into());
